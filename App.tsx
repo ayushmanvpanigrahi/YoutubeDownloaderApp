@@ -37,6 +37,8 @@ type Download = {
   url?: string;
 };
 
+type DownloadTask = ReturnType<typeof RNFS.downloadFile>;
+
 const App = () => {
   const [youtubeUrl, setYoutubeUrl] = useState<string>('');
   const [quality, setQuality] = useState<string>('1080p');
@@ -54,6 +56,7 @@ const App = () => {
   const [serverUrl, setServerUrl] = useState<string>(API_URL);
   const [showDownloadProgress, setShowDownloadProgress] = useState<boolean>(false);
   const [downloadProgress, setDownloadProgress] = useState<number>(0);
+  const [activeDownloads, setActiveDownloads] = useState<{[key: string]: DownloadTask}>({});
 
   // Helper function to show toast with debounce
   const showToast = useCallback((message: string, duration: number = ToastAndroid.SHORT) => {
@@ -90,70 +93,54 @@ const App = () => {
     if (Platform.OS !== 'android') return true;
     
     try {
-      // For Android 10 (API level 29) and above
+      console.log('Android Version:', Platform.Version);
+      
       if (Platform.Version >= 33) { // Android 13+
-        // For Android 13+, request new READ_MEDIA_VIDEO permission
+        console.log('Requesting Android 13+ permissions');
         const permissions = [
           PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
           PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES
         ];
         
         const results = await PermissionsAndroid.requestMultiple(permissions);
+        console.log('Permission results:', results);
         
-        // Check if all permissions are granted
+        // For Android 13+, we don't need WRITE_EXTERNAL_STORAGE
         const allGranted = Object.values(results).every(
           result => result === PermissionsAndroid.RESULTS.GRANTED
         );
         
-        if (allGranted) {
-          return true;
-        } else {
-          // Show custom dialog instead of Alert
-          showPermissionModal();
-          return false;
-        }
+        console.log('All permissions granted:', allGranted);
+        return allGranted;
       } 
       else if (Platform.Version >= 29) { // Android 10-12
-        // On Android 10-12, permissions handled differently but we still need to request them
-        const granted = await PermissionsAndroid.request(
+        console.log('Requesting Android 10-12 permissions');
+        const permissions = [
           PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
-          {
-            title: "Storage Permission",
-            message: "App needs access to your storage to download and play videos",
-            buttonNeutral: "Ask Me Later",
-            buttonNegative: "Cancel",
-            buttonPositive: "OK"
-          }
-        );
+          PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE
+        ];
         
-        if (granted === PermissionsAndroid.RESULTS.GRANTED) {
-          return true;
-        } else {
-          // Show custom dialog instead of Alert
-          showPermissionModal();
-          return false;
-        }
+        const results = await PermissionsAndroid.requestMultiple(permissions);
+        console.log('Permission results:', results);
+        
+        return Object.values(results).every(
+          result => result === PermissionsAndroid.RESULTS.GRANTED
+        );
       } 
       else { // Android 9 and below
-        // For older Android versions, request both read and write permissions
+        console.log('Requesting Android 9 and below permissions');
         const results = await PermissionsAndroid.requestMultiple([
           PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE,
           PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE
         ]);
         
-        if (
-          results[PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE] === PermissionsAndroid.RESULTS.GRANTED &&
-          results[PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE] === PermissionsAndroid.RESULTS.GRANTED
-        ) {
-          return true;
-        } else {
-          // Show custom dialog instead of Alert
-          showPermissionModal();
-          return false;
-        }
+        console.log('Permission results:', results);
+        return Object.values(results).every(
+          result => result === PermissionsAndroid.RESULTS.GRANTED
+        );
       }
     } catch (err) {
-      console.error(err);
+      console.error('Permission request error:', err);
       return false;
     }
   };
@@ -524,53 +511,29 @@ const App = () => {
 
   // Download file from server to local device
   const downloadToDevice = async (downloadId: string, videoTitle: string) => {
+    console.log('Starting download to device for ID:', downloadId);
+    
+    // First check permissions
+    const hasPermission = await requestStoragePermission();
+    console.log('Permission check result:', hasPermission);
+    
+    if (!hasPermission) {
+      Alert.alert(
+        'Permission Required',
+        'Storage permission is required to download videos. Please grant permission in Settings.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Open Settings', onPress: openSettings }
+        ]
+      );
+      return;
+    }
+
     // Get the video ID from downloadId (remove timestamp)
     const baseVideoId = downloadId.split('_')[0];
     
     try {
-      // Check current download status
-      const downloadInfo = await fetchDownloadInfo(downloadId);
-      
-      // If status is queued, we need to start a fresh download
-      if (downloadInfo?.status === 'queued') {
-        if (!downloadInfo.url) {
-          throw new Error('Missing video URL for re-download');
-        }
-
-        // Show re-download alert
-        Alert.alert(
-          'Starting New Download',
-          'Starting a fresh download of the video. Please wait...',
-          [{ text: 'OK' }]
-        );
-
-        // Start a new download
-        const response = await fetch(`${API_URL}/api/download`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            url: downloadInfo.url,
-            quality: quality,
-            playlist: false
-          })
-        });
-
-        if (!response.ok) {
-          throw new Error('Failed to start new download');
-        }
-
-        const data = await response.json();
-        if (!data.downloadId) {
-          throw new Error('No download ID received from server');
-        }
-
-        // Update the downloadId to the new one
-        downloadId = data.downloadId;
-      }
-
-      // Continue with rest of existing downloadToDevice logic
+      // Set download state immediately
       setDownloading(prev => ({ ...prev, [downloadId]: true }));
       setShowDownloadProgress(true);
 
@@ -581,57 +544,22 @@ const App = () => {
       
       if (Platform.OS === 'android') {
         try {
-          // First try to get the external storage directory
           const externalDir = RNFS.ExternalStorageDirectoryPath;
           const downloadsDir = `${externalDir}/Download`;
-          
-          // Create Downloads directory if it doesn't exist
-          const dirExists = await RNFS.exists(downloadsDir);
-          if (!dirExists) {
-            await RNFS.mkdir(downloadsDir);
-          }
-          
+          await RNFS.mkdir(downloadsDir).catch(() => {}); // Create if doesn't exist
           localFilePath = `${downloadsDir}/${fileName}`;
-          console.log('Using downloads directory:', localFilePath);
         } catch (error) {
-          console.error('Error accessing Downloads directory:', error);
-          // Fallback to app's external directory
+          console.error('Error setting up download path:', error);
           localFilePath = `${RNFS.ExternalDirectoryPath}/${fileName}`;
-          console.log('Falling back to app directory:', localFilePath);
         }
       } else {
-        // For iOS
         localFilePath = `${RNFS.DocumentDirectoryPath}/${fileName}`;
       }
 
-      console.log(`Starting download of video ID: ${downloadId} to ${localFilePath}`);
+      // Show initial progress dialog
+      ToastAndroid.show('Starting download...', ToastAndroid.SHORT);
 
-      // Show download progress alert
-      Alert.alert(
-        'Downloading...',
-        `Downloading video in ${quality}. Please wait...`,
-        [
-          {
-            text: 'Hide',
-            onPress: () => setShowDownloadProgress(false),
-            style: 'cancel',
-          }
-        ],
-        { cancelable: true }
-      );
-
-      // First check if the file exists on the server
-      const checkResponse = await fetch(`${API_URL}/api/download/${downloadId}/check`);
-      if (!checkResponse.ok) {
-        throw new Error('Failed to verify file on server');
-      }
-
-      const checkData = await checkResponse.json();
-      if (!checkData.exists) {
-        throw new Error(checkData.reason || 'File not found on server');
-      }
-
-      // Download using RNFS.downloadFile for better progress tracking and reliability
+      // Start download in background
       const downloadOptions = {
         fromUrl: `${API_URL}/api/download/${downloadId}`,
         toFile: localFilePath,
@@ -639,114 +567,113 @@ const App = () => {
         discretionary: true,
         progress: (res: { bytesWritten: number; contentLength: number }) => {
           const progressPercent = ((res.bytesWritten / res.contentLength) * 100).toFixed(0);
-          console.log(`Download progress: ${progressPercent}%`);
           setDownloadProgress(parseInt(progressPercent));
         },
-        headers: {
-          'Accept': 'video/mp4,application/octet-stream',
-          'Content-Type': 'application/octet-stream'
-        }
+        begin: (res: { statusCode: number; contentLength: number }) => {
+          console.log('Download started with status:', res.statusCode);
+          ToastAndroid.show('Download in progress...', ToastAndroid.SHORT);
+        },
+        progressDivider: 5 // Update progress every 5% instead of continuously
       };
 
-      try {
-        const download = await RNFS.downloadFile(downloadOptions).promise;
-        
-        if (download.statusCode !== 200) {
-          throw new Error(`Download failed with status: ${download.statusCode}`);
-        }
+      // Start the download
+      const downloadTask = RNFS.downloadFile(downloadOptions);
+      
+      // Add download task to state for tracking
+      setActiveDownloads(prev => ({
+        ...prev,
+        [downloadId]: downloadTask
+      }));
 
-        // Verify the downloaded file
-        const fileExists = await RNFS.exists(localFilePath);
-        if (!fileExists) {
-          throw new Error('File was not downloaded correctly');
-        }
+      // Wait for download to complete
+      const result = await downloadTask.promise;
 
-        const fileStats = await RNFS.stat(localFilePath);
-        if (fileStats.size < 1000) { // Less than 1KB is probably an error
-          await RNFS.unlink(localFilePath); // Delete the corrupted file
-          throw new Error('Downloaded file appears to be corrupted (too small)');
-        }
-
-        // Clear states after successful download
-        setDownloading(prev => ({ ...prev, [downloadId]: false }));
-        setShowDownloadProgress(false);
-        setDownloadProgress(0);
-        
-        if (Platform.OS === 'android') {
-          // Scan the file to make it visible in the media store
-          try {
-            await RNFS.scanFile(localFilePath);
-          } catch (scanError) {
-            console.warn('Error scanning file (file should still be accessible):', scanError);
-          }
-          
-          // Show success toast
-          ToastAndroid.show(`Video downloaded successfully in ${quality}!`, ToastAndroid.LONG);
-        }
-
-        // Show success alert with options to open
-        Alert.alert(
-          'Download Complete',
-          `Video downloaded successfully in ${quality}!`,
-          [
-            { text: 'OK' },
-            { 
-              text: 'Open',
-              onPress: async () => {
-                try {
-                  await FileViewer.open(localFilePath, {
-                    showOpenWithDialog: true,
-                    onDismiss: () => console.log('FileViewer dismissed')
-                  });
-                } catch (error) {
-                  console.error('Error opening file:', error);
-                  openWithAlternative(localFilePath, fileName);
-                }
-              }
-            }
-          ]
-        );
-      } catch (downloadError) {
-        console.error('Download error:', downloadError);
-        // Clean up any partially downloaded file
-        if (await RNFS.exists(localFilePath)) {
-          await RNFS.unlink(localFilePath);
-        }
-        throw new Error(`Download failed: ${(downloadError as Error).message}`);
+      if (result.statusCode !== 200) {
+        throw new Error(`Download failed with status: ${result.statusCode}`);
       }
 
-    } catch (error: any) {
-      console.error('Error in downloadToDevice:', error);
-      
-      // Clear states on error
+      // Verify downloaded file
+      const fileExists = await RNFS.exists(localFilePath);
+      if (!fileExists) {
+        throw new Error('File was not downloaded correctly');
+      }
+
+      const fileStats = await RNFS.stat(localFilePath);
+      if (fileStats.size < 1000) {
+        await RNFS.unlink(localFilePath);
+        throw new Error('Downloaded file appears to be corrupted');
+      }
+
+      // Make file visible in media store
+      if (Platform.OS === 'android') {
+        try {
+          await RNFS.scanFile(localFilePath);
+          ToastAndroid.show(
+            `Video saved to Downloads folder as "${fileName}"`,
+            ToastAndroid.LONG
+          );
+        } catch (scanError) {
+          console.warn('Error scanning file:', scanError);
+        }
+      }
+
+      // Clear states
       setDownloading(prev => ({ ...prev, [downloadId]: false }));
       setShowDownloadProgress(false);
       setDownloadProgress(0);
+      setActiveDownloads(prev => {
+        const newState = { ...prev };
+        delete newState[downloadId];
+        return newState;
+      });
+
+      // Show success alert
+      Alert.alert(
+        'Download Complete',
+        `Video saved as "${fileName}" in your Downloads folder`,
+        [
+          { text: 'OK' },
+          { 
+            text: 'Open',
+            onPress: async () => {
+              try {
+                await FileViewer.open(localFilePath);
+              } catch (error) {
+                console.error('Error opening file:', error);
+                Linking.openURL('content://media/external/downloads')
+                  .catch(() => {
+                    Alert.alert(
+                      'File Location',
+                      `The video has been saved to your Downloads folder as "${fileName}"`
+                    );
+                  });
+              }
+            }
+          }
+        ]
+      );
+
+    } catch (error) {
+      console.error('Download error:', error);
       
-      let errorMessage = 'Failed to download video. Please try again.';
-      
-      if (error.message.includes('storage')) {
-        errorMessage = 'Not enough storage space. Please free up some space and try again.';
-      } else if (error.message.includes('permission')) {
-        errorMessage = 'Storage permission is required. Please grant permission and try again.';
-      } else if (error.message.includes('network')) {
-        errorMessage = 'Network error. Please check your internet connection and try again.';
-      } else if (error.message.includes('corrupted')) {
-        errorMessage = 'The downloaded file was corrupted. Please try downloading again.';
-      }
+      setDownloading(prev => ({ ...prev, [downloadId]: false }));
+      setShowDownloadProgress(false);
+      setDownloadProgress(0);
+      setActiveDownloads(prev => {
+        const newState = { ...prev };
+        delete newState[downloadId];
+        return newState;
+      });
       
       Alert.alert(
         'Download Error',
-        errorMessage,
+        `Failed to download video: ${error instanceof Error ? error.message : 'Unknown error'}. Please try again.`,
         [
           { 
             text: 'Retry',
             onPress: () => downloadToDevice(downloadId, videoTitle)
           },
-          {
-            text: 'Cancel',
-            style: 'cancel'
-          }
+          { text: 'Cancel' }
         ]
       );
     }
