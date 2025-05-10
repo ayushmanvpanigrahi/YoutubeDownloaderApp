@@ -21,9 +21,7 @@ import FileViewer from 'react-native-file-viewer';
 
 // Define possible server addresses
 const SERVER_ADDRESSES = [
-  'http://192.168.150.158:5000', // Your actual network IP
-  'http://10.0.2.2:5000',        // Android emulator to localhost
-  'http://localhost:5000'        // Direct localhost
+  'http://192.168.221.158:5000', // Your actual network IP      // Direct localhost
 ];
 
 // Start with the most likely address
